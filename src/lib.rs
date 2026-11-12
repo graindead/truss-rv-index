@@ -1,7 +1,7 @@
 //! truss-rv-index: scans RhythmVerse's Clone Hero charts into a compact index for Truss.
 //! Used by the `truss-scan` command line tool and the `RV Cacher` window.
 
-// Copied from Truss (see README for the commit); some of their helpers aren't used here.
+// Copied from Truss commit 5e53391 (changes marked "rv-index"); some of their helpers aren't used here.
 #[allow(dead_code)]
 pub mod chart;
 #[allow(dead_code)]

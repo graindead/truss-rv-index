@@ -1,4 +1,4 @@
-//! RhythmVerse access, copied from Truss's rhythmverse.rs (see README for the commit) and cut
+//! RhythmVerse access, copied from Truss's rhythmverse.rs (commit 5e53391) and cut
 //! down to what the index needs: paging the Clone Hero list, resolving where each chart is
 //! hosted, and fetching only a chart's note files (notes.chart / notes.mid and song.ini).
 //! Changes from Truss are marked "rv-index".
