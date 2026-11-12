@@ -152,6 +152,17 @@ impl Store {
         );
     }
 
+    /// (file_id, scanned_at) of every chart, for tests.
+    pub fn scanned_times(&self) -> Vec<(String, i64)> {
+        let mut st = self.con.prepare("select file_id, scanned_at from charts where scanned_at > 0").unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Charts done for good (ok or unavailable).
+    pub fn count_done(&self) -> u64 {
+        self.con.query_row("select count(*) from charts where status != 'failed'", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
+    }
+
     /// Failed charts whose retry time has come.
     pub fn due_retries(&self, limit: usize) -> Vec<RvEntry> {
         let mut st = self

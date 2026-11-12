@@ -10,6 +10,10 @@ repository = "https://github.com/graindead/truss-rv-index"
 name = "truss-scan"
 path = "src/main.rs"
 
+[[bin]]
+name = "rv-cacher"
+path = "src/bin/rv-cacher.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time", "macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "system-proxy"] }
@@ -29,6 +33,7 @@ flate2 = "1"
 crc32fast = "1"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
+eframe = "0.37"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [profile.release]
