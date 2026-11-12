@@ -33,6 +33,9 @@ struct App {
     close_after_stop: bool,
 }
 
+/// How often the index file is written during a run.
+const SAVE_MINUTES: u64 = 10;
+
 fn data_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
 }
@@ -58,8 +61,10 @@ impl App {
     }
 
     fn start(&mut self) {
-        PROGRESS.stop.store(false, Relaxed);
-        PROGRESS.paused.store(false, Relaxed);
+        // Also used to start again after a stop: fresh counters for this run.
+        PROGRESS.reset();
+        *self.result.lock().unwrap() = None;
+        self.close_after_stop = false;
         let opts = ScanOpts {
             delay: self.delay,
             workers: self.workers,
@@ -67,6 +72,7 @@ impl App {
             page_size: 500,
             out: self.dir.join("out/rv-index.json.zst"),
             chart_timeout: 600,
+            save_every: SAVE_MINUTES * 60,
             max_minutes: 0,
         };
         let state = self.dir.join("state/rv-state.sqlite");
@@ -179,6 +185,16 @@ impl eframe::App for App {
                     ui.label("Downloaded");
                     ui.label(format!("{:.0} MB (only the notes are kept; the rest is deleted)", p.bytes.load(Relaxed) as f64 / 1_048_576.0));
                     ui.end_row();
+                    ui.label("Last saved");
+                    ui.label(match *p.last_saved.lock().unwrap() {
+                        Some(t) => format!(
+                            "{} ago (every song is saved as it finishes; the index file every {} min)",
+                            fmt_dur(t.elapsed().as_secs_f64().max(60.0)),
+                            SAVE_MINUTES
+                        ),
+                        None => format!("every song as it finishes; the index file every {} min", SAVE_MINUTES),
+                    });
+                    ui.end_row();
                     ui.label("Last song");
                     ui.label(p.last.lock().unwrap().clone().unwrap_or_else(|| "…".into()));
                     ui.end_row();
@@ -220,10 +236,20 @@ impl eframe::App for App {
                     ui.label(format!("Finishing {} song(s) and saving…", p.active.load(Relaxed)));
                 }
                 Mode::Done => {
+                    let all_done = remaining == 0 && total > 0;
+                    if !all_done {
+                        ui.label("Songs at once:");
+                        ui.add(egui::Slider::new(&mut self.workers, 1..=4));
+                        ui.add_space(12.0);
+                        if ui.add(egui::Button::new(egui::RichText::new("Resume caching").size(16.0)).min_size([160.0, 32.0].into())).clicked() {
+                            self.start();
+                            return;
+                        }
+                    }
                     match self.result.lock().unwrap().as_ref() {
                         Some(Err(e)) => ui.colored_label(egui::Color32::LIGHT_RED, format!("Stopped with an error: {e}")),
-                        _ if remaining == 0 && total > 0 => ui.label("All songs cached. The index is saved."),
-                        _ => ui.label("Saved. Open RV Cacher again any time to carry on."),
+                        _ if all_done => ui.label("All songs cached. The index is saved."),
+                        _ => ui.label("Saved."),
                     };
                 }
             });

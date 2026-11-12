@@ -49,12 +49,23 @@ pub struct Progress {
     /// Seconds spent paused, so the speed shown ignores pauses.
     pub paused_ms: AtomicU64,
     pub last: Mutex<Option<String>>,
+    /// When the index file was last written.
+    pub last_saved: Mutex<Option<Instant>>,
 }
 
 impl Progress {
     /// Charts finished for good this run (ok or unavailable).
     pub fn done_now(&self) -> u64 {
         self.ok.load(Relaxed) + self.unavailable.load(Relaxed)
+    }
+    /// Clears the counters for a new run (done_before / list_total are set by the run).
+    pub fn reset(&self) {
+        for c in [&self.ok, &self.unavailable, &self.failed, &self.bytes, &self.active, &self.paused_ms] {
+            c.store(0, Relaxed);
+        }
+        self.stop.store(false, Relaxed);
+        self.paused.store(false, Relaxed);
+        *self.last.lock().unwrap() = None;
     }
     /// Charts left to cache.
     pub fn remaining(&self) -> u64 {
@@ -86,6 +97,10 @@ pub struct ScanOpts {
     /// Give up on one chart after this many seconds.
     #[arg(long, default_value_t = 600)]
     pub chart_timeout: u64,
+    /// Write the index every this many seconds while scanning (each chart is saved to the
+    /// state database as it finishes either way).
+    #[arg(long, default_value_t = 600)]
+    pub save_every: u64,
     /// Stop scanning after this many minutes (0 = no limit); the index is still written.
     #[arg(long, default_value_t = 0)]
     pub max_minutes: u64,
@@ -207,11 +222,12 @@ struct Run {
     id: i64,
     n: usize,
     pacer: Pacer,
+    last_save: Instant,
 }
 
 impl Run {
     fn new(opts: &ScanOpts) -> Run {
-        Run { id: store::now(), n: 0, pacer: Pacer::new(opts) }
+        Run { id: store::now(), n: 0, pacer: Pacer::new(opts), last_save: Instant::now() }
     }
     fn in_time(opts: &ScanOpts) -> bool {
         opts.max_minutes == 0 || STARTED.elapsed() < Duration::from_secs(opts.max_minutes * 60)
@@ -289,6 +305,12 @@ impl Run {
             log_outcome(self.n, e, &o);
             store.save(e, o.status, o.reason.as_deref(), o.data.as_ref(), o.bytes, o.ms, self.id);
             pacer.after(&o).await;
+            if self.last_save.elapsed() >= Duration::from_secs(opts.save_every.max(10)) {
+                self.last_save = Instant::now();
+                if let Err(err) = export(store, &opts.out) {
+                    say!("couldn't save the index: {err}");
+                }
+            }
         }
         drop(results);
         // Cancelled scans never got to count themselves out.
@@ -436,6 +458,7 @@ pub async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days:
 }
 
 pub fn export(store: &Store, out: &std::path::Path) -> Result<(), String> {
+    *PROGRESS.last_saved.lock().unwrap() = Some(Instant::now());
     let index = index::build(store);
     let ok = index.charts.iter().filter(|c| c.s == "ok").count();
     let size = index::write(&index, out)?;
@@ -457,7 +480,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
         store.set_meta("backfill_page", "30");
-        let opts = ScanOpts { delay: 1.0, workers: 4, limit: 0, page_size: 500, out: std::env::temp_dir().join("rv-stop-resume.json.zst"), chart_timeout: 120, max_minutes: 0 };
+        let opts = ScanOpts { delay: 1.0, workers: 4, limit: 0, page_size: 500, out: std::env::temp_dir().join("rv-stop-resume.json.zst"), chart_timeout: 120, save_every: 600, max_minutes: 0 };
         let stopper = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(20)).await;
             PROGRESS.stop.store(true, Relaxed);
