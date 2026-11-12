@@ -2,7 +2,6 @@
 //! counter of downloaded bytes for the scan statistics.
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -15,14 +14,36 @@ pub static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build HTTP client")
 });
 
-static BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Records `n` downloaded body bytes.
-pub fn count(n: usize) {
-    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+tokio::task_local! {
+    static CHART_BYTES: std::cell::Cell<u64>;
 }
 
-/// Body bytes downloaded so far by this process.
-pub fn bytes() -> u64 {
-    BYTES.load(Ordering::Relaxed)
+/// Records `n` downloaded body bytes (in total, and for the chart being scanned).
+pub fn count(n: usize) {
+    let _ = CHART_BYTES.try_with(|c| c.set(c.get() + n as u64));
+}
+
+/// Runs `f`, also returning the bytes it downloaded (correct with several scans at once).
+pub async fn counted<F: std::future::Future>(f: F) -> (F::Output, u64) {
+    CHART_BYTES
+        .scope(std::cell::Cell::new(0), async {
+            let r = f.await;
+            (r, CHART_BYTES.with(|c| c.get()))
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn counts_each_scan_separately() {
+        let scan = |n: usize| async move {
+            for _ in 0..5 {
+                super::count(n);
+                tokio::task::yield_now().await;
+            }
+        };
+        let (a, b) = tokio::join!(super::counted(scan(10)), super::counted(scan(3)));
+        assert_eq!((a.1, b.1), (50, 15));
+    }
 }

@@ -43,9 +43,13 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct ScanOpts {
-    /// Seconds between charts (each chart's fetches count towards it).
+    /// Seconds between charts, per worker (each chart's fetches count towards it).
     #[arg(long, default_value_t = 3.0)]
     delay: f64,
+    /// Charts scanned at once. Starts are spread evenly, so the rate is workers / delay charts
+    /// per second.
+    #[arg(long, default_value_t = 1)]
+    workers: usize,
     /// Stop after scanning this many charts (0 = no limit).
     #[arg(long, default_value_t = 0)]
     limit: usize,
@@ -190,57 +194,66 @@ fn is_permanent(msg: &str) -> bool {
 
 async fn scan_one(e: &RvEntry, timeout: Duration) -> Outcome {
     let started = Instant::now();
-    let before = api::bytes();
-    let done = |status, reason: Option<String>, data| Outcome {
+    let ((status, reason, data), bytes) = api::counted(scan_inner(e, timeout)).await;
+    Outcome {
         status,
-        reason: reason.map(|r| r.replace("Truss", "the scanner")),
+        reason: reason.map(|r: String| r.replace("Truss", "the scanner")),
         data,
-        bytes: api::bytes() - before,
+        bytes,
         ms: started.elapsed().as_millis() as u64,
-    };
+    }
+}
+
+async fn scan_inner(e: &RvEntry, timeout: Duration) -> (Status, Option<String>, Option<record::ChartData>) {
     if !rhythmverse::can_download(&e.rv) {
         let why = match e.rv.external_url.as_deref() {
             Some(u) => format!("hosted on {}", rhythmverse::host_name(u)),
             None => "no download".into(),
         };
-        return done(Status::Unavailable, Some(why), None);
+        return (Status::Unavailable, Some(why), None);
     }
     let files = match tokio::time::timeout(timeout, rhythmverse::fetch_note_files(&e.rv)).await {
-        Err(_) => return done(Status::Failed, Some("timed out".into()), None),
+        Err(_) => return (Status::Failed, Some("timed out".into()), None),
         Ok(Err(msg)) => {
             let status = if is_permanent(&msg) { Status::Unavailable } else { Status::Failed };
-            return done(status, Some(msg), None);
+            return (status, Some(msg), None);
         }
         Ok(Ok(f)) => f,
     };
     match tokio::task::spawn_blocking(move || record::compute(&files)).await {
-        Ok(Ok(d)) => done(Status::Ok, None, Some(d)),
+        Ok(Ok(d)) => (Status::Ok, None, Some(d)),
         // The chart file itself is broken: permanent for this version.
-        Ok(Err(msg)) => done(Status::Unavailable, Some(format!("bad chart: {msg}")), None),
-        Err(_) => done(Status::Unavailable, Some("bad chart: the parser crashed".into()), None),
+        Ok(Err(msg)) => (Status::Unavailable, Some(format!("bad chart: {msg}")), None),
+        Err(_) => (Status::Unavailable, Some("bad chart: the parser crashed".into()), None),
     }
 }
 
-/// Paces charts `delay` apart and backs off when a host says to slow down.
+/// Spaces chart starts evenly: with `workers` scans at once and `delay` seconds per worker, a
+/// chart starts every delay / workers seconds. A host that says to slow down pauses everything.
 struct Pacer {
-    delay: Duration,
-    last: Option<Instant>,
+    gap: Duration,
+    next: tokio::sync::Mutex<Instant>,
 }
 
 impl Pacer {
-    async fn wait(&mut self) {
-        if let Some(last) = self.last {
-            let since = last.elapsed();
-            if since < self.delay {
-                tokio::time::sleep(self.delay - since).await;
-            }
-        }
-        self.last = Some(Instant::now());
+    fn new(opts: &ScanOpts) -> Pacer {
+        Pacer { gap: Duration::from_secs_f64(opts.delay / opts.workers.max(1) as f64), next: tokio::sync::Mutex::new(Instant::now()) }
     }
-    async fn after(&mut self, o: &Outcome) {
+    /// Waits for this chart's start slot.
+    async fn wait(&self) {
+        let at = {
+            let mut next = self.next.lock().await;
+            let at = (*next).max(Instant::now());
+            *next = at + self.gap;
+            at
+        };
+        tokio::time::sleep_until(at.into()).await;
+    }
+    async fn after(&self, o: &Outcome) {
         if o.reason.as_deref().is_some_and(|r| r.contains("limiting downloads") || r.contains("429")) {
             eprintln!("  a host is rate-limiting: pausing 2 minutes");
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            let mut next = self.next.lock().await;
+            *next = (*next).max(Instant::now() + Duration::from_secs(120));
         }
     }
 }
@@ -257,19 +270,63 @@ fn log_outcome(n: usize, e: &RvEntry, o: &Outcome) {
     println!("[{n}] {} {name}: {what} ({:.0} KB, {:.1} s)", e.file_id, o.bytes as f64 / 1024.0, o.ms as f64 / 1000.0);
 }
 
-/// Scans one chart, saves it and paces. Returns false when the run's limit is reached.
-async fn scan_and_save(store: &Store, e: &RvEntry, pacer: &mut Pacer, opts: &ScanOpts, n: &mut usize, run: i64) -> bool {
-    pacer.wait().await;
-    let o = scan_one(e, Duration::from_secs(opts.chart_timeout)).await;
-    *n += 1;
-    log_outcome(*n, e, &o);
-    store.save(e, o.status, o.reason.as_deref(), o.data.as_ref(), o.bytes, o.ms, run);
-    pacer.after(&o).await;
-    let in_time = opts.max_minutes == 0 || STARTED.elapsed() < Duration::from_secs(opts.max_minutes * 60);
-    if !in_time {
-        println!("time budget (--max-minutes) used up");
+/// One run's progress: charts scanned so far, and the shared pacing.
+struct Run {
+    id: i64,
+    n: usize,
+    pacer: Pacer,
+}
+
+impl Run {
+    fn new(opts: &ScanOpts) -> Run {
+        Run { id: store::now(), n: 0, pacer: Pacer::new(opts) }
     }
-    (opts.limit == 0 || *n < opts.limit) && in_time
+    fn in_time(opts: &ScanOpts) -> bool {
+        opts.max_minutes == 0 || STARTED.elapsed() < Duration::from_secs(opts.max_minutes * 60)
+    }
+    /// How many more charts the limits allow.
+    fn room(&self, opts: &ScanOpts) -> usize {
+        if !Run::in_time(opts) {
+            0
+        } else if opts.limit == 0 {
+            usize::MAX
+        } else {
+            opts.limit.saturating_sub(self.n)
+        }
+    }
+
+    /// Scans `entries`, `opts.workers` at a time, saving each as it finishes. Returns false when
+    /// the run's limit or time budget stopped it.
+    async fn scan_all(&mut self, store: &Store, entries: &[RvEntry], opts: &ScanOpts) -> bool {
+        use futures::StreamExt;
+        let take = entries.len().min(self.room(opts));
+        let timeout = Duration::from_secs(opts.chart_timeout);
+        let pacer = &self.pacer;
+        let mut results = futures::stream::iter(&entries[..take])
+            .map(|e| async move {
+                pacer.wait().await;
+                if !Run::in_time(opts) {
+                    return (e, None);
+                }
+                (e, Some(scan_one(e, timeout).await))
+            })
+            .buffer_unordered(opts.workers.max(1));
+        let mut stopped = take < entries.len();
+        while let Some((e, o)) = results.next().await {
+            let Some(o) = o else {
+                stopped = true;
+                continue;
+            };
+            self.n += 1;
+            log_outcome(self.n, e, &o);
+            store.save(e, o.status, o.reason.as_deref(), o.data.as_ref(), o.bytes, o.ms, self.id);
+            pacer.after(&o).await;
+        }
+        if !Run::in_time(opts) {
+            println!("time budget (--max-minutes) used up");
+        }
+        !stopped && self.room(opts) > 0
+    }
 }
 
 async fn list_page(page: u32, size: u32, newest_first: bool) -> Result<(Vec<RvEntry>, usize, u64), String> {
@@ -289,28 +346,27 @@ async fn list_page(page: u32, size: u32, newest_first: bool) -> Result<(Vec<RvEn
 }
 
 async fn backfill(store: &Store, opts: &ScanOpts, start_page: Option<u32>) -> Result<(), String> {
-    let run = store::now();
+    let mut run = Run::new(opts);
     let mut page: u32 = start_page.unwrap_or_else(|| store.get_meta("backfill_page").and_then(|p| p.parse().ok()).unwrap_or(1));
-    let mut pacer = Pacer { delay: Duration::from_secs_f64(opts.delay), last: None };
-    let mut n = 0;
     loop {
         let (entries, raw, total) = list_page(page, opts.page_size, true).await?;
         if raw == 0 {
             println!("backfill: reached the end of the list ({total} charts)");
-            store.set_meta("backfill_done", &run.to_string());
+            store.set_meta("backfill_done", &run.id.to_string());
             return Ok(());
         }
         println!("backfill: page {page} ({} Clone Hero charts of {raw}; {total} in the list)", entries.len());
-        for e in &entries {
-            store.mark_seen(&e.file_id, run);
-            if store.is_done(e) {
-                continue;
+        let mut todo = Vec::new();
+        for e in entries {
+            store.mark_seen(&e.file_id, run.id);
+            if !store.is_done(&e) {
+                todo.push(e);
             }
-            if !scan_and_save(store, e, &mut pacer, opts, &mut n, run).await {
-                println!("backfill: stopped after {n} charts (--limit); re-run to continue from page {page}");
-                store.set_meta("backfill_page", &page.to_string());
-                return Ok(());
-            }
+        }
+        if !run.scan_all(store, &todo, opts).await {
+            println!("backfill: stopped after {} charts; re-run to continue from page {page}", run.n);
+            store.set_meta("backfill_page", &page.to_string());
+            return Ok(());
         }
         page += 1;
         store.set_meta("backfill_page", &page.to_string());
@@ -318,29 +374,24 @@ async fn backfill(store: &Store, opts: &ScanOpts, start_page: Option<u32>) -> Re
 }
 
 async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days: i64) -> Result<(), String> {
-    let run = store::now();
-    let mut pacer = Pacer { delay: Duration::from_secs_f64(opts.delay), last: None };
-    let mut n = 0;
-    let budget = |n: usize| opts.limit == 0 || n < opts.limit;
+    let mut run = Run::new(opts);
 
     // 1. New and changed charts, newest first, until a version we already have.
     let mut page = 1;
-    'pages: loop {
+    loop {
         let (entries, raw, _) = list_page(page, opts.page_size, true).await?;
         if raw == 0 {
             break;
         }
-        for e in &entries {
-            if let Some((m, _)) = store.known(&e.file_id)
-                && m == e.modified
-            {
-                println!("update: caught up at {} ({})", e.file_id, e.modified);
-                break 'pages;
-            }
-            if !scan_and_save(store, e, &mut pacer, opts, &mut n, run).await {
-                println!("update: stopped after {n} charts (--limit)");
-                return Ok(());
-            }
+        let known = entries.iter().position(|e| store.known(&e.file_id).is_some_and(|(m, _)| m == e.modified));
+        let todo = &entries[..known.unwrap_or(entries.len())];
+        if !run.scan_all(store, todo, opts).await {
+            println!("update: stopped after {} charts", run.n);
+            return Ok(());
+        }
+        if let Some(i) = known {
+            println!("update: caught up at {} ({})", entries[i].file_id, entries[i].modified);
+            break;
         }
         page += 1;
     }
@@ -349,16 +400,14 @@ async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days: i64
     let retries = store.due_retries(500);
     if !retries.is_empty() {
         println!("update: retrying {} earlier failures", retries.len());
-    }
-    for e in &retries {
-        if !budget(n) || !scan_and_save(store, e, &mut pacer, opts, &mut n, run).await {
+        if !run.scan_all(store, &retries, opts).await {
             return Ok(());
         }
     }
 
     // 3. Weekly: the whole list, to drop deleted charts and pick up anything missed.
     let last_full: i64 = store.get_meta("last_full_pass").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if full || run - last_full >= full_every_days * 86400 {
+    if full || run.id - last_full >= full_every_days * 86400 {
         println!("update: full pass");
         let mut page = 1;
         let mut missed = Vec::new();
@@ -368,7 +417,7 @@ async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days: i64
                 break;
             }
             for e in entries {
-                store.mark_seen(&e.file_id, run);
+                store.mark_seen(&e.file_id, run.id);
                 if store.known(&e.file_id).is_none_or(|(m, _)| m != e.modified) {
                     missed.push(e);
                 }
@@ -379,14 +428,10 @@ async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days: i64
         if page <= 2 {
             return Err("the full pass got an empty list; not dropping anything".into());
         }
-        let dropped = store.drop_unseen(run);
+        let dropped = store.drop_unseen(run.id);
         println!("update: full pass done: {dropped} deleted charts dropped, {} not yet scanned", missed.len());
-        store.set_meta("last_full_pass", &run.to_string());
-        for e in &missed {
-            if !budget(n) || !scan_and_save(store, e, &mut pacer, opts, &mut n, run).await {
-                break;
-            }
-        }
+        store.set_meta("last_full_pass", &run.id.to_string());
+        run.scan_all(store, &missed, opts).await;
     }
     Ok(())
 }
