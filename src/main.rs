@@ -26,9 +26,9 @@ enum Cmd {
     Backfill {
         #[command(flatten)]
         opts: ScanOpts,
-        /// Start from this page instead of the saved one (already-scanned charts are skipped).
-        #[arg(long)]
-        start_page: Option<u32>,
+        /// Read RhythmVerse's song list again when the saved one is older than this (0 = always).
+        #[arg(long, default_value_t = 24)]
+        list_max_age_hours: i64,
     },
     /// Scan new and changed charts (newest first, until reaching a known one), retry earlier
     /// failures, and once a week (or with --full) walk the whole list to drop deleted charts.
@@ -91,7 +91,7 @@ async fn main() {
                 }
             };
             match cmd {
-                Cmd::Backfill { opts, start_page } => backfill(&store, &opts, start_page).await.and_then(|_| export(&store, &opts.out)),
+                Cmd::Backfill { opts, list_max_age_hours } => backfill(&store, &opts, list_max_age_hours).await.and_then(|_| export(&store, &opts.out)),
                 Cmd::Update { opts, full, full_every_days } => {
                     update(&store, &opts, full, full_every_days).await.and_then(|_| export(&store, &opts.out))
                 }

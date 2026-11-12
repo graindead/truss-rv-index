@@ -52,9 +52,8 @@ impl App {
             }
             l.push_back(msg);
         });
-        // What's already cached, before starting.
-        let done_before = Store::open(&dir.join("state/rv-state.sqlite")).map(|s| s.count_done()).unwrap_or(0);
-        let saved_total = Store::open(&dir.join("state/rv-state.sqlite")).ok().and_then(|s| s.get_meta("list_total")).and_then(|v| v.parse().ok()).unwrap_or(0);
+        // What's already cached, from the saved song list.
+        let (saved_total, done_before) = Store::open(&dir.join("state/rv-state.sqlite")).map(|s| s.queue_counts()).unwrap_or((0, 0));
         PROGRESS.done_before.store(done_before, Relaxed);
         PROGRESS.list_total.store(saved_total, Relaxed);
         App { dir, mode: Mode::Idle, workers: 4, delay: 3.0, log, result: Arc::new(Mutex::new(None)), started: None, done_before, close_after_stop: false }
@@ -82,8 +81,7 @@ impl App {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             let r = rt.block_on(async {
                 let store = Store::open(&state)?;
-                let r = scan::backfill(&store, &opts, None).await;
-                store.set_meta("list_total", &PROGRESS.list_total.load(Relaxed).to_string());
+                let r = scan::backfill(&store, &opts, 24).await;
                 // Always leave a current index behind, finished or not.
                 scan::export(&store, &opts.out)?;
                 r
@@ -145,6 +143,17 @@ impl eframe::App for App {
             let total = p.list_total.load(Relaxed);
             let remaining = p.remaining();
             let done = total.saturating_sub(remaining);
+            let listing = p.listing_page.load(Relaxed);
+            if listing > 0 {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(egui::RichText::new("Reading RhythmVerse's song list").size(24.0).strong());
+                    let pages = p.listing_pages.load(Relaxed).max(listing);
+                    ui.add(egui::ProgressBar::new(listing as f32 / pages as f32).desired_width(ui.available_width() - 40.0));
+                    ui.label(format!("page {listing} of about {pages}; then songs are cached smallest first"));
+                    ui.add_space(20.0);
+                });
+            } else {
             ui.vertical_centered(|ui| {
                 ui.add_space(12.0);
                 let big = if total == 0 { "…".to_string() } else { fmt_num(remaining) };
@@ -156,9 +165,11 @@ impl eframe::App for App {
                 if total > 0 {
                     ui.label(format!("{} of {} cached", fmt_num(done), fmt_num(total)));
                 } else {
-                    ui.label(format!("{} cached so far (the total shows once the scan starts)", fmt_num(self.done_before)));
+                    ui.label(format!("{} cached so far (the total shows once the song list is read)", fmt_num(self.done_before)));
                 }
+                ui.label(egui::RichText::new("Smallest songs first").weak());
             });
+            }
             ui.add_space(12.0);
 
             // Session numbers.
@@ -228,7 +239,7 @@ impl eframe::App for App {
                     ui.label(if paused {
                         if active > 0 { format!("Pausing: finishing {active} song(s)…") } else { "Paused. You can also close the window; it resumes next time.".into() }
                     } else {
-                        format!("Caching, {} at once (page {})", self.workers, p.page.load(Relaxed))
+                        format!("Caching, {} at once, smallest songs first", self.workers)
                     });
                 }
                 Mode::Stopping => {

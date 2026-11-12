@@ -46,6 +46,9 @@ pub struct Progress {
     /// Charts downloading right now.
     pub active: AtomicU64,
     pub page: AtomicU64,
+    /// While reading the song list: the page being read and how many pages there are.
+    pub listing_page: AtomicU64,
+    pub listing_pages: AtomicU64,
     /// Seconds spent paused, so the speed shown ignores pauses.
     pub paused_ms: AtomicU64,
     pub last: Mutex<Option<String>>,
@@ -338,59 +341,87 @@ pub async fn list_page(page: u32, size: u32, newest_first: bool) -> Result<(Vec<
     unreachable!()
 }
 
-pub async fn backfill(store: &Store, opts: &ScanOpts, start_page: Option<u32>) -> Result<(), String> {
-    let mut run = Run::new(opts);
-    let resuming = start_page.is_none();
-    let mut page: u32 = start_page.unwrap_or_else(|| store.get_meta("backfill_page").and_then(|p| p.parse().ok()).unwrap_or(1));
-    // A resumed backfill that started mid-list goes round to page 1 once it reaches the end and
-    // stops when it gets back to where it started, so no page is left out.
-    let first_page = page;
-    let mut wrapped = false;
-    PROGRESS.done_before.store(store.count_done(), Relaxed);
+/// Reads RhythmVerse's whole song list (with file sizes) into the state, unless it was read in
+/// the last `max_age_hours` (0 = always). Returns false if it was stopped part-way.
+pub async fn refresh_list(store: &Store, page_size: u32, max_age_hours: i64) -> Result<bool, String> {
+    let now = store::now();
+    let last: i64 = store.get_meta("list_read_at").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if store.queue_counts().0 > 0 && max_age_hours > 0 && now - last < max_age_hours * 3600 {
+        return Ok(true);
+    }
+    say!("reading RhythmVerse's song list…");
+    let mut page = 1u32;
     loop {
-        if wrapped && page >= first_page {
-            say!("backfill: went all the way round the list");
-            store.set_meta("backfill_page", "1");
-            store.set_meta("backfill_done", &run.id.to_string());
-            return Ok(());
-        }
         if PROGRESS.stop.load(Relaxed) {
-            say!("backfill: stopped; it will continue from page {page}");
-            return Ok(());
+            PROGRESS.listing_page.store(0, Relaxed);
+            return Ok(false);
         }
-        PROGRESS.page.store(page as u64, Relaxed);
-        let (entries, raw, total) = list_page(page, opts.page_size, true).await?;
+        PROGRESS.listing_page.store(page as u64, Relaxed);
+        let (entries, raw, total) = list_page(page, page_size, true).await?;
         if total > 0 {
-            PROGRESS.list_total.store(total, Relaxed);
+            PROGRESS.listing_pages.store(total.div_ceil(page_size as u64), Relaxed);
         }
         if raw == 0 {
-            if resuming && first_page > 1 && !wrapped {
-                say!("backfill: reached the end of the list; going back to page 1 for the pages before {first_page}");
-                wrapped = true;
-                page = 1;
-                store.set_meta("backfill_page", "1");
-                continue;
-            }
-            say!("backfill: reached the end of the list ({total} charts)");
-            store.set_meta("backfill_page", "1");
+            break;
+        }
+        for e in &entries {
+            store.mark_seen(&e.file_id, now);
+        }
+        store.queue_put(&entries, now);
+        page += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    PROGRESS.listing_page.store(0, Relaxed);
+    if page <= 2 {
+        return Err("RhythmVerse sent an empty song list".into());
+    }
+    let dropped = store.queue_drop_unseen(now);
+    store.set_meta("list_read_at", &now.to_string());
+    let (total, done) = store.queue_counts();
+    say!("song list read: {total} songs ({done} already cached){}", if dropped > 0 { format!(", {dropped} no longer listed") } else { String::new() });
+    Ok(true)
+}
+
+/// Caches every song in the list, smallest first. Resumable: stopping keeps everything scanned
+/// so far, and the next run carries on with the smallest songs not done yet. The list is read
+/// again when it's over `list_max_age_hours` old.
+pub async fn backfill(store: &Store, opts: &ScanOpts, list_max_age_hours: i64) -> Result<(), String> {
+    if !refresh_list(store, opts.page_size, list_max_age_hours).await? {
+        say!("backfill: stopped while reading the song list");
+        return Ok(());
+    }
+    let mut run = Run::new(opts);
+    let counts = |run: &Run| {
+        let (total, done) = store.queue_counts();
+        PROGRESS.list_total.store(total, Relaxed);
+        // The window counts this run's songs on top of what was done before it.
+        let this_run = PROGRESS.done_now();
+        PROGRESS.done_before.store(done.saturating_sub(this_run), Relaxed);
+        let _ = run;
+    };
+    loop {
+        counts(&run);
+        if PROGRESS.stop.load(Relaxed) {
+            say!("backfill: stopped; it carries on with the smallest songs left next time");
+            return Ok(());
+        }
+        let todo = store.queue_todo(500);
+        if todo.is_empty() {
+            say!("backfill: every song in the list is cached");
             store.set_meta("backfill_done", &run.id.to_string());
             return Ok(());
         }
-        say!("backfill: page {page} ({} Clone Hero charts of {raw}; {total} in the list)", entries.len());
-        let mut todo = Vec::new();
-        for e in entries {
-            store.mark_seen(&e.file_id, run.id);
-            if !store.is_done(&e) {
-                todo.push(e);
-            }
-        }
+        say!(
+            "backfill: next {} songs, {:.1}–{:.1} MB each",
+            todo.len(),
+            todo.first().map(|e| e.size).unwrap_or(0) as f64 / 1_048_576.0,
+            todo.last().map(|e| e.size).unwrap_or(0) as f64 / 1_048_576.0
+        );
         if !run.scan_all(store, &todo, opts).await {
-            say!("backfill: stopped after {} charts; re-run to continue from page {page}", run.n);
-            store.set_meta("backfill_page", &page.to_string());
+            counts(&run);
+            say!("backfill: stopped after {} songs; it carries on with the smallest songs left next time", run.n);
             return Ok(());
         }
-        page += 1;
-        store.set_meta("backfill_page", &page.to_string());
     }
 }
 
@@ -479,34 +510,51 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rv-stop-resume-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
-        store.set_meta("backfill_page", "30");
-        let opts = ScanOpts { delay: 1.0, workers: 4, limit: 0, page_size: 500, out: std::env::temp_dir().join("rv-stop-resume.json.zst"), chart_timeout: 120, save_every: 600, max_minutes: 0 };
+        // One page of the real list stands in for the whole list.
+        let (entries, _, _) = list_page(30, 500, true).await.unwrap();
+        store.queue_put(&entries, store::now());
+        store.set_meta("list_read_at", &store::now().to_string());
+        let opts = ScanOpts {
+            delay: 1.0,
+            workers: 4,
+            limit: 0,
+            page_size: 500,
+            out: std::env::temp_dir().join("rv-stop-resume.json.zst"),
+            chart_timeout: 120,
+            save_every: 600,
+            max_minutes: 0,
+        };
         let stopper = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(20)).await;
             PROGRESS.stop.store(true, Relaxed);
             Instant::now()
         });
-        backfill(&store, &opts, None).await.unwrap();
+        backfill(&store, &opts, 24).await.unwrap();
         let stopped_at = stopper.await.unwrap();
-        let first = store.count_done() + store.stats(0).failed;
-        println!("first run saved {first} charts; stopped {:?} after the request", stopped_at.elapsed());
-        assert!(first >= 1, "saved {first}");
+        let first = store.scanned_times();
+        println!("first run saved {} songs; stopped {:?} after the request", first.len(), stopped_at.elapsed());
+        assert!(!first.is_empty());
         assert!(stopped_at.elapsed() < Duration::from_secs(2));
-        assert_eq!(store.get_meta("backfill_page").as_deref(), Some("30"));
-        let before: Vec<(String, i64)> = store.scanned_times();
+        // Smallest first: everything scanned is no bigger than anything left.
+        let biggest_done = first.iter().filter_map(|(id, _)| entries.iter().find(|e| &e.file_id == id)).map(|e| e.size).max().unwrap();
+        // Only songs that were still downloading when it stopped (one per worker) can be
+        // smaller than the biggest one done.
+        let smaller_left = store.queue_todo(50).iter().filter(|e| e.size < biggest_done).count();
+        println!("biggest scanned {biggest_done} bytes; {smaller_left} smaller songs left (cancelled mid-download)");
+        assert!(smaller_left <= opts.workers, "{smaller_left}");
 
-        // Reopen: carry on for a few seconds more.
-        PROGRESS.stop.store(false, Relaxed);
+        // Reopen: carry on for a while more.
+        PROGRESS.reset();
         let stopper = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(15)).await;
             PROGRESS.stop.store(true, Relaxed);
         });
-        backfill(&store, &opts, None).await.unwrap();
+        backfill(&store, &opts, 24).await.unwrap();
         stopper.await.unwrap();
         let after = store.scanned_times();
-        let rescanned = before.iter().filter(|(id, t)| after.iter().any(|(a, u)| a == id && u != t)).count();
-        println!("second run: {} charts in total, {rescanned} scanned again", after.len());
-        assert!(after.len() > before.len());
+        let rescanned = first.iter().filter(|(id, t)| after.iter().any(|(a, u)| a == id && u != t)).count();
+        println!("second run: {} songs in total, {rescanned} scanned again", after.len());
+        assert!(after.len() > first.len());
         assert_eq!(rescanned, 0);
         drop(store);
         let _ = std::fs::remove_file(&path);

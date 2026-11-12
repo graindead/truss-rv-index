@@ -75,7 +75,20 @@ impl Store {
                 artist text,
                 charter text
              );
-             create table if not exists meta (key text primary key, value text not null);",
+             create table if not exists meta (key text primary key, value text not null);
+             create table if not exists queue (
+                file_id text primary key,
+                modified text not null,
+                size integer not null default 0,
+                download_url text,
+                external_url text,
+                page_url text,
+                title text,
+                artist text,
+                charter text,
+                seen integer not null default 0
+             );
+             create index if not exists queue_size on queue (size);",
         )
         .map_err(|e| e.to_string())?;
         Ok(Store { con })
@@ -152,6 +165,65 @@ impl Store {
         );
     }
 
+    /// Saves one page of RhythmVerse's song list.
+    pub fn queue_put(&self, entries: &[RvEntry], seen: i64) {
+        let Ok(tx) = self.con.unchecked_transaction() else { return };
+        for e in entries {
+            let _ = tx.execute(
+                "insert or replace into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![e.file_id, e.modified, e.size as i64, e.rv.download_url, e.rv.external_url, e.rv.page_url, e.title, e.artist, e.charter, seen],
+            );
+        }
+        let _ = tx.commit();
+    }
+
+    /// Forgets songs that weren't in the latest full read of the list (deleted on RhythmVerse).
+    pub fn queue_drop_unseen(&self, seen: i64) -> usize {
+        self.con.execute("delete from queue where seen < ?1", [seen]).unwrap_or(0)
+    }
+
+    /// The next songs to cache, smallest first: not scanned yet, changed since, or failed and due
+    /// for a retry.
+    pub fn queue_todo(&self, limit: usize) -> Vec<RvEntry> {
+        let mut st = self
+            .con
+            .prepare(
+                "select q.file_id, q.modified, q.download_url, q.external_url, q.page_url, q.title, q.artist, q.charter, q.size
+                 from queue q left join charts c on c.file_id = q.file_id
+                 where c.file_id is null or c.modified != q.modified or (c.status = 'failed' and c.next_retry <= ?1)
+                 order by q.size, q.file_id limit ?2",
+            )
+            .unwrap();
+        st.query_map(params![now(), limit as i64], |r| {
+            Ok(RvEntry {
+                file_id: r.get(0)?,
+                modified: r.get(1)?,
+                rv: RvFile { download_url: r.get(2)?, external_url: r.get(3)?, page_url: r.get::<_, Option<String>>(4)?.unwrap_or_default(), title: r.get(5)? },
+                title: r.get(5)?,
+                artist: r.get(6)?,
+                charter: r.get(7)?,
+                size: r.get::<_, i64>(8)?.max(0) as u64,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// (songs in the list, of those done for good: ok or unavailable for their listed version).
+    pub fn queue_counts(&self) -> (u64, u64) {
+        let total = self.con.query_row("select count(*) from queue", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64;
+        let done = self
+            .con
+            .query_row(
+                "select count(*) from queue q join charts c on c.file_id = q.file_id where c.modified = q.modified and c.status != 'failed'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
+        (total, done)
+    }
+
     /// (file_id, scanned_at) of every chart, for tests.
     pub fn scanned_times(&self) -> Vec<(String, i64)> {
         let mut st = self.con.prepare("select file_id, scanned_at from charts where scanned_at > 0").unwrap();
@@ -180,6 +252,7 @@ impl Store {
                 title: r.get(5)?,
                 artist: r.get(6)?,
                 charter: r.get(7)?,
+                size: 0,
             })
         })
         .map(|rows| rows.flatten().collect())
