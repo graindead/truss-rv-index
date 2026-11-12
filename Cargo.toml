@@ -1,0 +1,40 @@
+[package]
+name = "truss-rv-index"
+version = "0.1.0"
+edition = "2024"
+description = "Scans RhythmVerse's Clone Hero charts once and keeps a compact index (leaderboard hashes, Fretwork ratings, features) for Truss"
+license = "GPL-3.0"
+repository = "https://github.com/graindead/truss-rv-index"
+
+[[bin]]
+name = "truss-scan"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+midly = "0.5"
+base64 = "0.22"
+blake3 = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false }
+unrar = "0.5.8"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+flate2 = "1"
+crc32fast = "1"
+zstd = "0.13"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2

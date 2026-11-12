@@ -1,0 +1,72 @@
+name: Update rv-index
+
+# Scans new and changed RhythmVerse charts and replaces the index on the `rv-index` release.
+# The scanner's state lives on the same release (rv-state.sqlite.zst), so nothing is committed.
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Do the full pass (drop deleted charts) now"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rv-index
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: rv-index
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Make sure the release exists
+        run: |
+          gh release view "$RELEASE" >/dev/null 2>&1 || \
+            gh release create "$RELEASE" --title "RhythmVerse index" \
+              --notes "Updated automatically. See FORMAT.md for the file format." --latest=false
+
+      - name: Get the previous state
+        id: state
+        run: |
+          mkdir -p state out
+          # Only start fresh when the release really has no state; a failed download stops the
+          # run instead of overwriting the published state with an empty one.
+          if gh release view "$RELEASE" --json assets --jq '.assets[].name' | grep -qx rv-state.sqlite.zst; then
+            gh release download "$RELEASE" --pattern rv-state.sqlite.zst --dir state
+            zstd -d --rm -f state/rv-state.sqlite.zst -o state/rv-state.sqlite
+          else
+            echo "No previous state: starting fresh (run backfill locally first for a full index)."
+          fi
+
+      - name: Update
+        run: |
+          ./target/release/truss-scan update --delay 3 --max-minutes 300 \
+            ${{ github.event.inputs.full == 'true' && '--full' || '' }}
+          ./target/release/truss-scan stats --hours 6 || true
+
+      - name: Publish the index and state
+        # Also after a failed or timed-out update (every scanned chart is already saved), but
+        # never when the previous state couldn't be fetched.
+        if: always() && steps.state.outcome == 'success'
+        run: |
+          test -f out/rv-index.json.zst || ./target/release/truss-scan export
+          sqlite3 state/rv-state.sqlite "pragma wal_checkpoint(truncate);" || true
+          zstd -19 -f state/rv-state.sqlite -o state/rv-state.sqlite.zst
+          gh release upload "$RELEASE" out/rv-index.json.zst state/rv-state.sqlite.zst --clobber
