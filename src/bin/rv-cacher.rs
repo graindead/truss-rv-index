@@ -206,7 +206,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| match self.mode {
                 Mode::Idle => {
                     ui.label("Songs at once:");
-                    ui.add(egui::Slider::new(&mut self.workers, 1..=4));
+                    ui.add(egui::Slider::new(&mut self.workers, 1..=20));
                     ui.add_space(12.0);
                     let label = if self.done_before > 0 { "Resume caching" } else { "Start caching" };
                     if ui.add(egui::Button::new(egui::RichText::new(label).size(16.0)).min_size([160.0, 32.0].into())).clicked() {
@@ -239,7 +239,7 @@ impl eframe::App for App {
                     let all_done = remaining == 0 && total > 0;
                     if !all_done {
                         ui.label("Songs at once:");
-                        ui.add(egui::Slider::new(&mut self.workers, 1..=4));
+                        ui.add(egui::Slider::new(&mut self.workers, 1..=20));
                         ui.add_space(12.0);
                         if ui.add(egui::Button::new(egui::RichText::new("Resume caching").size(16.0)).min_size([160.0, 32.0].into())).clicked() {
                             self.start();

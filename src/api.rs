@@ -9,7 +9,7 @@ pub static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         // Say who we are (no pretending to be a web browser).
         .user_agent(concat!("truss-rv-index/", env!("CARGO_PKG_VERSION"), " (+https://github.com/graindead/truss-rv-index)"))
         .connect_timeout(std::time::Duration::from_secs(15))
-        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(20)
         .build()
         .expect("failed to build HTTP client")
 });
