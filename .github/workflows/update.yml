@@ -3,8 +3,10 @@ name: Update rv-index
 # Scans new and changed RhythmVerse charts and replaces the index on the `rv-index` release.
 # The scanner's state lives on the same release (rv-state.sqlite.zst), so nothing is committed.
 on:
-  schedule:
-    - cron: "17 */6 * * *" # every 6 hours
+  # Manual only (Actions tab > Update rv-index > Run workflow). To run it on its own every
+  # 6 hours, add:
+  #   schedule:
+  #     - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       full:
