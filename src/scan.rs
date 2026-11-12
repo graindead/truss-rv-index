@@ -349,6 +349,17 @@ pub async fn refresh_list(store: &Store, page_size: u32, max_age_hours: i64) -> 
     if store.queue_counts().0 > 0 && max_age_hours > 0 && now - last < max_age_hours * 3600 {
         return Ok(true);
     }
+    // Truss keeps the same list; use it when it synced more recently than this one.
+    if let Some(path) = truss_cache()
+        && let Ok(synced) = truss_synced(&path)
+        && synced > last
+        && (max_age_hours == 0 || now - synced < max_age_hours * 3600)
+    {
+        match import_truss_list(store, &path) {
+            Ok(_) => return Ok(true),
+            Err(e) => say!("couldn't use Truss's song list ({e}); reading RhythmVerse's instead"),
+        }
+    }
     say!("reading RhythmVerse's song list…");
     let mut page = 1u32;
     loop {
@@ -380,6 +391,38 @@ pub async fn refresh_list(store: &Store, page_size: u32, max_age_hours: i64) -> 
     let (total, done) = store.queue_counts();
     say!("song list read: {total} songs ({done} already cached){}", if dropped > 0 { format!(", {dropped} no longer listed") } else { String::new() });
     Ok(true)
+}
+
+/// Truss's RhythmVerse cache, if Truss is installed (%LOCALAPPDATA%\truss\cache).
+pub fn truss_cache() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let p = PathBuf::from(base).join("truss").join("cache").join("rhythmverse.sqlite");
+    p.exists().then_some(p)
+}
+
+/// When Truss last synced its RhythmVerse cache (unix seconds).
+pub fn truss_synced(path: &std::path::Path) -> Result<i64, String> {
+    let con = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+    let v: String = con.query_row("select value from meta where key = 'last_sync'", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    v.parse().map_err(|_| "no sync time".to_string())
+}
+
+/// Uses Truss's RhythmVerse cache as the song list (only read, never changed).
+pub fn import_truss_list(store: &Store, path: &std::path::Path) -> Result<usize, String> {
+    let now = store::now();
+    let (n, synced) = store.import_truss(path, now)?;
+    if n < 1000 {
+        return Err(format!("Truss's cache only has {n} songs"));
+    }
+    let dropped = store.queue_drop_unseen(now);
+    // The list is as fresh as Truss's last sync.
+    store.set_meta("list_read_at", &synced.min(now).to_string());
+    let (total, done) = store.queue_counts();
+    say!(
+        "song list taken from Truss's cache: {total} songs ({done} already cached){}; songs without a known file size are ordered by length, unknown ones last",
+        if dropped > 0 { format!(", {dropped} no longer listed") } else { String::new() }
+    );
+    Ok(n)
 }
 
 /// Caches every song in the list, smallest first. Resumable: stopping keeps everything scanned

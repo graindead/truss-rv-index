@@ -91,6 +91,8 @@ impl Store {
              create index if not exists queue_size on queue (size);",
         )
         .map_err(|e| e.to_string())?;
+        // Song length (from Truss's cache), to order songs whose file size isn't known.
+        let _ = con.execute("alter table queue add column length_ms integer not null default 0", []);
         Ok(Store { con })
     }
 
@@ -170,12 +172,56 @@ impl Store {
         let Ok(tx) = self.con.unchecked_transaction() else { return };
         for e in entries {
             let _ = tx.execute(
-                "insert or replace into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "insert into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 on conflict(file_id) do update set modified = excluded.modified, size = excluded.size,
+                   download_url = excluded.download_url, external_url = excluded.external_url, page_url = excluded.page_url,
+                   title = excluded.title, artist = excluded.artist, charter = excluded.charter, seen = excluded.seen",
                 params![e.file_id, e.modified, e.size as i64, e.rv.download_url, e.rv.external_url, e.rv.page_url, e.title, e.artist, e.charter, seen],
             );
         }
         let _ = tx.commit();
+    }
+
+    /// Copies the song list from Truss's own RhythmVerse cache (opened read-only). Truss keeps no
+    /// file sizes, so songs keep a size RhythmVerse gave earlier when their version is unchanged
+    /// and are otherwise ordered by length (about 50 bytes per ms of song). Returns (songs, when
+    /// Truss last synced, unix seconds).
+    pub fn import_truss(&self, path: &Path, seen: i64) -> Result<(usize, i64), String> {
+        let truss = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .map_err(|e| format!("can't open Truss's cache: {e}"))?;
+        let synced: i64 = truss
+            .query_row("select value from meta where key = 'last_sync'", [], |r| r.get::<_, String>(0))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut st = truss
+            .prepare("select uid, modified, download_url, external_url, page_url, name, artist, charter, length_ms from charts")
+            .map_err(|e| format!("Truss's cache isn't what was expected: {e}"))?;
+        type Row = (String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+        let rows: Vec<Row> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        let tx = self.con.unchecked_transaction().map_err(|e| e.to_string())?;
+        for (uid, modified, dl, ext, page, name, artist, charter, length) in &rows {
+            // Truss stores "YYYY-MM-DDTHH:MM:SS"; RhythmVerse (and this state) use a space.
+            let modified = modified.replacen('T', " ", 1);
+            tx.execute(
+                "insert into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen, length_ms)
+                 values (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 on conflict(file_id) do update set
+                   size = case when queue.modified = excluded.modified then queue.size else 0 end,
+                   modified = excluded.modified, download_url = excluded.download_url, external_url = excluded.external_url,
+                   page_url = excluded.page_url, title = excluded.title, artist = excluded.artist, charter = excluded.charter,
+                   seen = excluded.seen, length_ms = excluded.length_ms",
+                params![uid, modified, dl, ext, page.clone().unwrap_or_default(), name, artist, charter, seen, length.unwrap_or(0)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((rows.len(), synced))
     }
 
     /// Forgets songs that weren't in the latest full read of the list (deleted on RhythmVerse).
@@ -192,7 +238,7 @@ impl Store {
                 "select q.file_id, q.modified, q.download_url, q.external_url, q.page_url, q.title, q.artist, q.charter, q.size
                  from queue q left join charts c on c.file_id = q.file_id
                  where c.file_id is null or c.modified != q.modified or (c.status = 'failed' and c.next_retry <= ?1)
-                 order by q.size, q.file_id limit ?2",
+                 order by case when q.size > 0 then q.size when q.length_ms > 0 then q.length_ms * 50 else 1000000000000 end, q.file_id limit ?2",
             )
             .unwrap();
         st.query_map(params![now(), limit as i64], |r| {

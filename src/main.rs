@@ -68,6 +68,12 @@ enum Cmd {
         #[arg(long, default_value = "out/rv-index.json.zst")]
         index: PathBuf,
     },
+    /// Use Truss's RhythmVerse cache as the song list (it's only read, never changed).
+    ImportTruss {
+        /// Truss's rhythmverse.sqlite (default: %LOCALAPPDATA%\truss\cache\rhythmverse.sqlite).
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
     /// Write the index from the state.
     Export {
         #[arg(long, default_value = "out/rv-index.json.zst")]
@@ -100,6 +106,10 @@ async fn main() {
                     Ok(())
                 }
                 Cmd::Export { out } => export(&store, &out),
+                Cmd::ImportTruss { from } => match from.or_else(scan::truss_cache) {
+                    Some(path) => scan::import_truss_list(&store, &path).map(|_| ()),
+                    None => Err("Truss's RhythmVerse cache wasn't found; pass --from".into()),
+                },
                 Cmd::Probe { .. } | Cmd::Show { .. } => unreachable!(),
             }
         }
