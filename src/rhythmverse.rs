@@ -184,6 +184,9 @@ fn encode_url(u: &str) -> String {
         .map(|c| match c {
             ' ' => "%20".to_string(),
             '#' => "%23".to_string(),
+            // rv-index fix: a literal % or ? in a file name ("100% Lucha.zip") broke the link.
+            '%' => "%25".to_string(),
+            '?' => "%3F".to_string(),
             '[' => "%5B".to_string(),
             ']' => "%5D".to_string(),
             c if c.is_ascii() => c.to_string(),
@@ -805,6 +808,15 @@ mod tests {
         let rv = to_entry(&own).unwrap().rv;
         assert_eq!(rv.download_url.as_deref(), Some("https://rhythmverse.co/download_file/someone/e0178/Pierce The Veil - Shared Trauma.zip"));
         assert!(rv.external_url.is_none() && can_download(&rv));
+    }
+
+    #[test]
+    fn encodes_percent_and_question_marks() {
+        assert_eq!(
+            encode_url("https://rhythmverse.co/download_file/a/1/100% Lucha - V?.zip"),
+            "https://rhythmverse.co/download_file/a/1/100%25%20Lucha%20-%20V%3F.zip"
+        );
+        assert_eq!(encode_url("https://rhythmverse.co/download_file/a/1/Death, Drugs %26 Dancing.zip"), "https://rhythmverse.co/download_file/a/1/Death,%20Drugs%20%2526%20Dancing.zip");
     }
 
     #[test]

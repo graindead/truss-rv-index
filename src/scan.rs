@@ -135,6 +135,8 @@ pub fn is_permanent(msg: &str) -> bool {
         "doesn't know how to open",
         "isn't a valid",
         "Damaged",
+        // A .7z / .rar that 7-Zip also can't unpack.
+        "Couldn't unpack the .",
         "The host refused",
         "Couldn't find the MediaFire download link",
     ]
@@ -200,10 +202,19 @@ impl Pacer {
         tokio::time::sleep_until(at.into()).await;
     }
     async fn after(&self, o: &Outcome) {
-        if o.reason.as_deref().is_some_and(|r| r.contains("limiting downloads") || r.contains("429")) {
-            say!("  a host is rate-limiting: pausing 2 minutes");
+        let r = o.reason.as_deref().unwrap_or("");
+        let pause = if r.contains("limiting downloads") || r.contains("429") {
+            120
+        } else if r.contains("download limit") || r.contains("returned 503") {
+            // Google Drive pushing back: ease off for everyone so it doesn't spread.
+            30
+        } else {
+            0
+        };
+        if pause > 0 {
+            say!("  a host is pushing back: pausing {pause} s");
             let mut next = self.next.lock().await;
-            *next = (*next).max(Instant::now() + Duration::from_secs(120));
+            *next = (*next).max(Instant::now() + Duration::from_secs(pause));
         }
     }
 }

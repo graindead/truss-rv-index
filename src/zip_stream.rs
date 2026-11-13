@@ -125,6 +125,14 @@ pub async fn fetch(url: &str, work: &Path, dest: &Path, keep: impl Fn(&str) -> O
         });
     }
     if resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("text/html")) {
+        // RhythmVerse answers an empty page when the file is gone from its storage (its own
+        // download page then says "This file is missing").
+        if url.contains("rhythmverse.co/") && resp.content_length() == Some(0) {
+            return Err("This chart is no longer available: RhythmVerse says the file is missing (the author may have deleted it).".into());
+        }
+        if url.contains("google.com") {
+            return Err("Google Drive's download limit for this file was reached (it resets within a day); will try again later.".into());
+        }
         return Err("The host sent a web page instead of the file (it may be over its download limit or need a sign-in).".into());
     }
     let mut src = Src { stream: Box::pin(resp.bytes_stream()), buf: Vec::new(), pos: 0, eof: false };
