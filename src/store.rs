@@ -172,12 +172,13 @@ impl Store {
         let Ok(tx) = self.con.unchecked_transaction() else { return };
         for e in entries {
             let _ = tx.execute(
-                "insert into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "insert into queue (file_id, modified, size, download_url, external_url, page_url, title, artist, charter, seen, length_ms)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  on conflict(file_id) do update set modified = excluded.modified, size = excluded.size,
                    download_url = excluded.download_url, external_url = excluded.external_url, page_url = excluded.page_url,
-                   title = excluded.title, artist = excluded.artist, charter = excluded.charter, seen = excluded.seen",
-                params![e.file_id, e.modified, e.size as i64, e.rv.download_url, e.rv.external_url, e.rv.page_url, e.title, e.artist, e.charter, seen],
+                   title = excluded.title, artist = excluded.artist, charter = excluded.charter, seen = excluded.seen,
+                   length_ms = case when excluded.length_ms > 0 then excluded.length_ms else queue.length_ms end",
+                params![e.file_id, e.modified, e.size as i64, e.rv.download_url, e.rv.external_url, e.rv.page_url, e.title, e.artist, e.charter, seen, e.length_ms as i64],
             );
         }
         let _ = tx.commit();
@@ -250,6 +251,7 @@ impl Store {
                 artist: r.get(6)?,
                 charter: r.get(7)?,
                 size: r.get::<_, i64>(8)?.max(0) as u64,
+                length_ms: 0,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -299,6 +301,7 @@ impl Store {
                 artist: r.get(6)?,
                 charter: r.get(7)?,
                 size: 0,
+                length_ms: 0,
             })
         })
         .map(|rows| rows.flatten().collect())

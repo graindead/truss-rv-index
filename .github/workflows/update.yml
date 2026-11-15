@@ -1,12 +1,13 @@
 name: Update rv-index
 
-# Scans new and changed RhythmVerse charts and replaces the index on the `rv-index` release.
-# The scanner's state lives on the same release (rv-state.sqlite.zst), so nothing is committed.
+# Keeps the RhythmVerse cache current: every hour, scans charts uploaded or changed since the
+# last run (usually a handful), retries earlier failures, and once a week walks the whole list to
+# drop deleted charts. The cache (rv-state.sqlite.zst) and the index for Truss
+# (rv-index.json.zst) live on the `rv-index` release, so nothing is committed. Truss Index's
+# "Deploy site" reads the cache from there.
 on:
-  # Manual only (Actions tab > Update rv-index > Run workflow). To run it on its own every
-  # 6 hours, add:
-  #   schedule:
-  #     - cron: "17 */6 * * *"
+  schedule:
+    - cron: "41 * * * *" # hourly
   workflow_dispatch:
     inputs:
       full:
@@ -24,7 +25,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE: rv-index
@@ -36,39 +37,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bin truss-scan
 
-      - name: Make sure the release exists
-        run: |
-          gh release view "$RELEASE" >/dev/null 2>&1 || \
-            gh release create "$RELEASE" --title "RhythmVerse index" \
-              --notes "Updated automatically. See FORMAT.md for the file format." --latest=false
-
-      - name: Get the previous state
+      - name: Get the cache
         id: state
         run: |
           mkdir -p state out
-          # Only start fresh when the release really has no state; a failed download stops the
-          # run instead of overwriting the published state with an empty one.
-          if gh release view "$RELEASE" --json assets --jq '.assets[].name' | grep -qx rv-state.sqlite.zst; then
-            gh release download "$RELEASE" --pattern rv-state.sqlite.zst --dir state
-            zstd -d --rm -f state/rv-state.sqlite.zst -o state/rv-state.sqlite
-          else
-            echo "No previous state: starting fresh (run backfill locally first for a full index)."
-          fi
+          # The cache is seeded from the local backfill. Never start from nothing: that would
+          # replace the published cache with an empty one.
+          gh release download "$RELEASE" --pattern rv-state.sqlite.zst --dir state
+          zstd -d --rm -f state/rv-state.sqlite.zst -o state/rv-state.sqlite
 
       - name: Update
         run: |
-          ./target/release/truss-scan update --delay 3 --max-minutes 300 \
+          # Small newest-first pages (the full pass still reads 500 at a time), 2 songs at once,
+          # and stop scanning after 45 minutes so hourly runs don't pile up.
+          ./target/release/truss-scan update --page-size 50 --workers 2 --delay 3 --max-minutes 45 \
             ${{ github.event.inputs.full == 'true' && '--full' || '' }}
-          ./target/release/truss-scan stats --hours 6 || true
+          ./target/release/truss-scan stats --hours 2 || true
 
-      - name: Publish the index and state
+      - name: Publish the index and cache
         # Also after a failed or timed-out update (every scanned chart is already saved), but
-        # never when the previous state couldn't be fetched.
+        # never when the cache couldn't be fetched.
         if: always() && steps.state.outcome == 'success'
         run: |
           test -f out/rv-index.json.zst || ./target/release/truss-scan export
-          sqlite3 state/rv-state.sqlite "pragma wal_checkpoint(truncate);" || true
           zstd -19 -f state/rv-state.sqlite -o state/rv-state.sqlite.zst
           gh release upload "$RELEASE" out/rv-index.json.zst state/rv-state.sqlite.zst --clobber

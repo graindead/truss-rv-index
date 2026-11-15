@@ -491,6 +491,8 @@ pub async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days:
         }
         let known = entries.iter().position(|e| store.known(&e.file_id).is_some_and(|(m, _)| m == e.modified));
         let todo = &entries[..known.unwrap_or(entries.len())];
+        // Keep the song list current too (the site reads song lengths from it).
+        store.queue_put(todo, run.id);
         if !run.scan_all(store, todo, opts).await {
             say!("update: stopped after {} charts", run.n);
             return Ok(());
@@ -522,6 +524,7 @@ pub async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days:
             if raw == 0 {
                 break;
             }
+            store.queue_put(&entries, run.id);
             for e in entries {
                 store.mark_seen(&e.file_id, run.id);
                 if store.known(&e.file_id).is_none_or(|(m, _)| m != e.modified) {
@@ -535,6 +538,7 @@ pub async fn update(store: &Store, opts: &ScanOpts, full: bool, full_every_days:
             return Err("the full pass got an empty list; not dropping anything".into());
         }
         let dropped = store.drop_unseen(run.id);
+        store.queue_drop_unseen(run.id);
         say!("update: full pass done: {dropped} deleted charts dropped, {} not yet scanned", missed.len());
         store.set_meta("last_full_pass", &run.id.to_string());
         run.scan_all(store, &missed, opts).await;

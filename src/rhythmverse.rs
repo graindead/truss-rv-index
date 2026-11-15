@@ -63,6 +63,8 @@ pub struct RvEntry {
     pub rv: RvFile,
     /// rv-index: the chart file's size in bytes as RhythmVerse lists it (0 if unknown).
     pub size: u64,
+    /// rv-index: the song's length in ms as RhythmVerse lists it (0 if unknown).
+    pub length_ms: u64,
 }
 
 /// rv-index: Truss's `to_chart`, keeping only what the index needs.
@@ -97,6 +99,7 @@ pub fn to_entry(song: &Value) -> Option<RvEntry> {
     Some(RvEntry {
         modified: s(&file["update_date"]).unwrap_or_default(),
         size: int(&file["size"]).or_else(|| int(&file["file_size"])).unwrap_or(0).max(0) as u64,
+        length_ms: int(&data["song_length"]).or_else(|| int(&file["file_song_length"])).unwrap_or(0).max(0) as u64 * 1000,
         artist: s(&data["artist"]).or_else(|| s(&file["file_artist"])),
         charter: s(&file["charter"]).or_else(|| s(&file["author"]["name"])),
         title: title.clone(),
