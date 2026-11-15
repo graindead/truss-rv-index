@@ -1,22 +1,28 @@
 name: Update rv-index
 
-# Keeps the RhythmVerse cache current: every hour, scans charts uploaded or changed since the
-# last run (usually a handful), retries earlier failures, and once a week walks the whole list to
-# drop deleted charts. The cache (rv-state.sqlite.zst) and the index for Truss
-# (rv-index.json.zst) live on the `rv-index` release, so nothing is committed. Truss Index's
+# Keeps the RhythmVerse cache current. One run lasts about 5.5 hours (GitHub's job limit is 6)
+# and starts the next one itself, so it doesn't rely on GitHub's scheduler, which skips runs.
+# Every 30 minutes it scans charts uploaded or changed since the last round (usually a handful),
+# retries earlier failures that are due, and once a week walks the whole list to drop deleted
+# charts; then it publishes the cache (rv-state.sqlite.zst) and the index for Truss
+# (rv-index.json.zst) to the `rv-index` release, so nothing is committed. Truss Index's hourly
 # "Deploy site" reads the cache from there.
+#
+# The schedule below is only a fallback that restarts the chain if it ever breaks; while a run is
+# going, a scheduled one waits in the queue and is replaced by the next chained run.
 on:
   schedule:
-    - cron: "41 * * * *" # hourly
+    - cron: "41 */3 * * *"
   workflow_dispatch:
     inputs:
       full:
-        description: "Do the full pass (drop deleted charts) now"
+        description: "Do the full pass (drop deleted charts) in the first round"
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: write # the release, the keep-alive commit
+  actions: write # start the next run
 
 concurrency:
   group: rv-index
@@ -25,12 +31,23 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 355
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE: rv-index
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub turns off schedules in repos with no commits for 60 days.
+      - name: Keep the fallback schedule active
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keep the fallback schedule active"
+            git push
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -40,7 +57,6 @@ jobs:
         run: cargo build --release --locked --bin truss-scan
 
       - name: Get the cache
-        id: state
         run: |
           mkdir -p state out
           # The cache is seeded from the local backfill. Never start from nothing: that would
@@ -48,19 +64,36 @@ jobs:
           gh release download "$RELEASE" --pattern rv-state.sqlite.zst --dir state
           zstd -d --rm -f state/rv-state.sqlite.zst -o state/rv-state.sqlite
 
-      - name: Update
+      - name: Watch
+        shell: bash
         run: |
-          # Small newest-first pages (the full pass still reads 500 at a time), 2 songs at once,
-          # and stop scanning after 45 minutes so hourly runs don't pile up.
-          ./target/release/truss-scan update --page-size 50 --workers 2 --delay 3 --max-minutes 45 \
-            ${{ github.event.inputs.full == 'true' && '--full' || '' }}
-          ./target/release/truss-scan stats --hours 2 || true
+          # Keep going through a failed round (a RhythmVerse or GitHub hiccup); the next one retries.
+          set +e
+          bin=./target/release/truss-scan
+          end=$(( $(date +%s) + 330 * 60 ))
+          full="${{ github.event.inputs.full == 'true' && '--full' || '' }}"
 
-      - name: Publish the index and cache
-        # Also after a failed or timed-out update (every scanned chart is already saved), but
-        # never when the cache couldn't be fetched.
-        if: always() && steps.state.outcome == 'success'
-        run: |
-          test -f out/rv-index.json.zst || ./target/release/truss-scan export
-          zstd -19 -f state/rv-state.sqlite -o state/rv-state.sqlite.zst
-          gh release upload "$RELEASE" out/rv-index.json.zst state/rv-state.sqlite.zst --clobber
+          publish() {
+            $bin export &&
+            zstd -q -19 -f state/rv-state.sqlite -o state/rv-state.sqlite.zst &&
+            gh release upload "$RELEASE" out/rv-index.json.zst state/rv-state.sqlite.zst --clobber
+          }
+
+          while :; do
+            start=$(date +%s)
+            left=$(( (end - start) / 60 ))
+            [ $left -ge 5 ] || break
+            budget=$(( left < 25 ? left : 25 ))
+            # Small newest-first pages (the weekly full pass still reads 500 at a time) and 2
+            # songs at once.
+            $bin update --page-size 50 --workers 2 --delay 3 --max-minutes $budget $full | grep -v 'download limit'
+            [ "${PIPESTATUS[0]}" = 0 ] || echo "update failed; trying again next round"
+            full=""
+            publish && echo "published at $(date -u +%H:%M)" || echo "publishing failed"
+            next=$(( start + 30 * 60 ))
+            [ $next -lt $end ] || break
+            now=$(date +%s)
+            [ $now -ge $next ] || sleep $(( next - now ))
+          done
+
+          gh workflow run update.yml && echo "started the next run"
